@@ -1,0 +1,416 @@
+<?php
+/**
+ * Plugin Name: BuddyPress Achievements & Badges
+ * Description: Adds a simple achievements / badges system for BuddyPress and WordPress. Awards badges for milestones (first post, joining X groups, Y logins, etc.).
+ * Version: 1.0
+ * Author: Cryptoball cryptoball7@gmail.com
+ * Text Domain: bp-achievements
+ * Domain Path: /languages
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit; // Exit if accessed directly
+}
+
+class BP_Achievements {
+    private static $instance = null;
+    const CPT_BADGE = 'bp_badge';
+
+    public static function instance() {
+        if ( self::$instance === null ) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    private function __construct() {
+        register_activation_hook( __FILE__, array( $this, 'activate' ) );
+        register_deactivation_hook( __FILE__, array( $this, 'deactivate' ) );
+
+        add_action( 'init', array( $this, 'register_badge_cpt' ) );
+        add_action( 'admin_enqueue_scripts', array( $this, 'admin_assets' ) );
+        add_action( 'add_meta_boxes', array( $this, 'badge_metaboxes' ) );
+        add_action( 'save_post', array( $this, 'save_badge_meta' ) );
+
+        // Hooks for awarding
+        add_action( 'wp_login', array( $this, 'on_wp_login' ), 10, 2 );
+        add_action( 'bp_activity_posted_update', array( $this, 'on_activity_posted_update' ), 10, 3 );
+        add_action( 'groups_member_added', array( $this, 'on_group_member_added' ), 10, 2 );
+
+        // Display badges on member header
+        add_action( 'bp_before_member_header_meta', array( $this, 'display_member_badges' ) );
+
+        // Shortcode to display badges
+        add_shortcode( 'bp_user_badges', array( $this, 'shortcode_user_badges' ) );
+
+        // AJAX: manually award
+        add_action( 'wp_ajax_bpab_award_badge', array( $this, 'ajax_award_badge' ) );
+
+        // Load textdomain
+        add_action( 'plugins_loaded', function() { load_plugin_textdomain( 'bp-achievements', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' ); } );
+    }
+
+    public function activate() {
+        $this->register_badge_cpt();
+        flush_rewrite_rules();
+    }
+
+    public function deactivate() {
+        flush_rewrite_rules();
+    }
+
+    public function register_badge_cpt() {
+        $labels = array(
+            'name'               => __( 'Badges', 'bp-achievements' ),
+            'singular_name'      => __( 'Badge', 'bp-achievements' ),
+            'menu_name'          => __( 'Badges', 'bp-achievements' ),
+            'name_admin_bar'     => __( 'Badge', 'bp-achievements' ),
+            'add_new'            => __( 'Add New', 'bp-achievements' ),
+            'add_new_item'       => __( 'Add New Badge', 'bp-achievements' ),
+            'new_item'           => __( 'New Badge', 'bp-achievements' ),
+            'edit_item'          => __( 'Edit Badge', 'bp-achievements' ),
+            'view_item'          => __( 'View Badge', 'bp-achievements' ),
+            'all_items'          => __( 'All Badges', 'bp-achievements' ),
+            'search_items'       => __( 'Search Badges', 'bp-achievements' ),
+        );
+
+        $args = array(
+            'labels'             => $labels,
+            'public'             => false,
+            'show_ui'            => true,
+            'show_in_menu'       => true,
+            'supports'           => array( 'title', 'editor', 'thumbnail' ),
+            'capability_type'    => 'post',
+        );
+
+        register_post_type( self::CPT_BADGE, $args );
+    }
+
+    public function admin_assets( $hook ) {
+        if ( strpos( $hook, 'post.php' ) !== false || strpos( $hook, 'post-new.php' ) !== false ) {
+            global $post;
+            if ( isset( $post ) && $post->post_type === self::CPT_BADGE ) {
+                wp_enqueue_media();
+                wp_enqueue_script( 'bpab-admin', plugins_url( 'assets/admin.js', __FILE__ ), array( 'jquery' ), '1.0', true );
+                wp_localize_script( 'bpab-admin', 'BPAB', array( 'nonce' => wp_create_nonce( 'bpab' ) ) );
+                wp_enqueue_style( 'bpab-admin-css', plugins_url( 'assets/admin.css', __FILE__ ) );
+            }
+        }
+    }
+
+    public function badge_metaboxes() {
+        add_meta_box( 'bpab-badge-settings', __( 'Badge Settings', 'bp-achievements' ), array( $this, 'render_badge_settings_metabox' ), self::CPT_BADGE, 'normal', 'high' );
+    }
+
+    public function render_badge_settings_metabox( $post ) {
+        wp_nonce_field( 'bpab_save_badge', 'bpab_badge_nonce' );
+
+        $type = get_post_meta( $post->ID, 'ab_type', true ) ?: 'login';
+        $threshold = get_post_meta( $post->ID, 'ab_threshold', true ) ?: '';
+        $desc = get_post_meta( $post->ID, 'ab_description', true ) ?: '';
+        $image_id = get_post_meta( $post->ID, 'ab_image_id', true );
+        $image_url = $image_id ? wp_get_attachment_url( $image_id ) : '';
+
+        // Simple form
+        ?>
+        <p>
+            <label for="ab_type"><?php _e( 'Badge Type', 'bp-achievements' ); ?></label><br/>
+            <select name="ab_type" id="ab_type">
+                <option value="login" <?php selected( $type, 'login' ); ?>><?php _e( 'Login milestones', 'bp-achievements' ); ?></option>
+                <option value="post" <?php selected( $type, 'post' ); ?>><?php _e( 'Activity posts', 'bp-achievements' ); ?></option>
+                <option value="groups" <?php selected( $type, 'groups' ); ?>><?php _e( 'Groups joined', 'bp-achievements' ); ?></option>
+                <option value="custom" <?php selected( $type, 'custom' ); ?>><?php _e( 'Custom (use programmatic awarding)', 'bp-achievements' ); ?></option>
+            </select>
+        </p>
+        <p>
+            <label for="ab_threshold"><?php _e( 'Threshold (integer)', 'bp-achievements' ); ?></label><br/>
+            <input type="number" name="ab_threshold" id="ab_threshold" value="<?php echo esc_attr( $threshold ); ?>" />
+        </p>
+        <p>
+            <label for="ab_description"><?php _e( 'Public description (optional)', 'bp-achievements' ); ?></label><br/>
+            <textarea name="ab_description" id="ab_description" rows="3" style="width:100%;"><?php echo esc_textarea( $desc ); ?></textarea>
+        </p>
+        <p>
+            <label><?php _e( 'Badge image', 'bp-achievements' ); ?></label><br/>
+            <img id="ab_image_preview" src="<?php echo esc_url( $image_url ); ?>" style="max-width:120px;<?php echo $image_url ? '' : 'display:none;'; ?>" />
+            <input type="hidden" name="ab_image_id" id="ab_image_id" value="<?php echo esc_attr( $image_id ); ?>" />
+            <p>
+                <a href="#" class="button" id="ab_upload_image"><?php _e( 'Choose image', 'bp-achievements' ); ?></a>
+                <a href="#" class="button" id="ab_remove_image" style="display:"<?php echo $image_url ? 'inline-block' : 'none'; ?>"><?php _e( 'Remove', 'bp-achievements' ); ?></a>
+            </p>
+        </p>
+        <p style="color:#777; font-size:12px;"><?php _e( 'Examples: create a badge with type=post threshold=1 for "First post"; type=groups threshold=5 for "Joined 5 groups"; type=login threshold=100 for "100 logins". For custom badges, use the programmatic award function.', 'bp-achievements' ); ?></p>
+        <?php
+    }
+
+    public function save_badge_meta( $post_id ) {
+        if ( wp_is_post_autosave( $post_id ) || wp_is_post_revision( $post_id ) ) {
+            return;
+        }
+        if ( ! isset( $_POST['bpab_badge_nonce'] ) || ! wp_verify_nonce( $_POST['bpab_badge_nonce'], 'bpab_save_badge' ) ) {
+            return;
+        }
+        if ( get_post_type( $post_id ) !== self::CPT_BADGE ) {
+            return;
+        }
+
+        $type = isset( $_POST['ab_type'] ) ? sanitize_text_field( $_POST['ab_type'] ) : 'login';
+        $threshold = isset( $_POST['ab_threshold'] ) ? intval( $_POST['ab_threshold'] ) : 0;
+        $desc = isset( $_POST['ab_description'] ) ? sanitize_textarea_field( $_POST['ab_description'] ) : '';
+        $image_id = isset( $_POST['ab_image_id'] ) ? intval( $_POST['ab_image_id'] ) : 0;
+
+        update_post_meta( $post_id, 'ab_type', $type );
+        update_post_meta( $post_id, 'ab_threshold', $threshold );
+        update_post_meta( $post_id, 'ab_description', $desc );
+        update_post_meta( $post_id, 'ab_image_id', $image_id );
+    }
+
+    /* --------------------------- Awarding mechanisms --------------------------- */
+
+    // Hook: wp_login
+    public function on_wp_login( $user_login, $user ) {
+        $user_id = $user->ID;
+        $count = (int) get_user_meta( $user_id, 'ab_logins', true );
+        $count++;
+        update_user_meta( $user_id, 'ab_logins', $count );
+
+        $this->check_and_award_badges( $user_id, 'login' );
+    }
+
+    // Hook: bp_activity_posted_update (BuddyPress) - when a user posts an update
+    // Signature: bp_activity_posted_update( $content, $user_id, $activity_id )
+    public function on_activity_posted_update( $content, $user_id, $activity_id ) {
+        // increment posts count
+        $count = (int) get_user_meta( $user_id, 'ab_posts', true );
+        $count++;
+        update_user_meta( $user_id, 'ab_posts', $count );
+
+        $this->check_and_award_badges( $user_id, 'post' );
+    }
+
+    // Hook: groups_member_added (BuddyPress)
+    // Signature: groups_member_added( $group_id, $user_id )
+    public function on_group_member_added( $group_id, $user_id ) {
+        $count = (int) get_user_meta( $user_id, 'ab_groups_joined', true );
+        $count++;
+        update_user_meta( $user_id, 'ab_groups_joined', $count );
+
+        $this->check_and_award_badges( $user_id, 'groups' );
+    }
+
+    // Core check function
+    public function check_and_award_badges( $user_id, $type = null ) {
+        // Query badges: either all or filtered by type
+        $args = array( 'post_type' => self::CPT_BADGE, 'posts_per_page' => -1, 'post_status' => 'publish' );
+        if ( $type ) {
+            $args['meta_query'] = array( array( 'key' => 'ab_type', 'value' => $type ) );
+        }
+        $badges = get_posts( $args );
+
+        foreach ( $badges as $badge ) {
+            $badge_id = $badge->ID;
+            $badge_type = get_post_meta( $badge_id, 'ab_type', true );
+            $threshold = intval( get_post_meta( $badge_id, 'ab_threshold', true ) );
+
+            $value = 0;
+            switch ( $badge_type ) {
+                case 'login':
+                    $value = (int) get_user_meta( $user_id, 'ab_logins', true );
+                    break;
+                case 'post':
+                    $value = (int) get_user_meta( $user_id, 'ab_posts', true );
+                    break;
+                case 'groups':
+                    $value = (int) get_user_meta( $user_id, 'ab_groups_joined', true );
+                    break;
+                case 'custom':
+                    // custom badges should be awarded programmatically via bpab_award_badge
+                    continue 2; // skip automatic awarding
+                default:
+                    continue 2;
+            }
+
+            if ( $threshold > 0 && $value >= $threshold ) {
+                if ( ! $this->user_has_badge( $user_id, $badge_id ) ) {
+                    $this->award_badge_to_user( $user_id, $badge_id );
+                }
+            }
+        }
+    }
+
+    public function user_has_badge( $user_id, $badge_id ) {
+        $awarded = get_user_meta( $user_id, 'ab_awarded_badges', true );
+        if ( ! is_array( $awarded ) ) {
+            return false;
+        }
+        return in_array( $badge_id, $awarded );
+    }
+
+    public function award_badge_to_user( $user_id, $badge_id, $silent = false ) {
+        if ( $this->user_has_badge( $user_id, $badge_id ) ) {
+            return false;
+        }
+
+        $awarded = get_user_meta( $user_id, 'ab_awarded_badges', true );
+        if ( ! is_array( $awarded ) ) {
+            $awarded = array();
+        }
+        $awarded[] = $badge_id;
+        update_user_meta( $user_id, 'ab_awarded_badges', $awarded );
+
+        // store timestamped meta for convenience
+        add_user_meta( $user_id, 'ab_badge_' . $badge_id, time() );
+
+        // create BuddyPress activity if BuddyPress exists
+        if ( function_exists( 'bp_activity_add' ) && ! $silent ) {
+            $badge_title = get_the_title( $badge_id );
+            $activity_content = sprintf( __( "%s earned the badge: %s", 'bp-achievements' ), bp_core_get_userlink( $user_id ), esc_html( $badge_title ) );
+            bp_activity_add( array(
+                'action' => $activity_content,
+                'content' => '',
+                'component' => 'achievements',
+                'type' => 'badge_awarded',
+                'user_id' => $user_id,
+            ) );
+        }
+
+        // optionally: send a notification / email
+        if ( ! $silent ) {
+            $this->notify_user_of_badge( $user_id, $badge_id );
+        }
+
+        do_action( 'bpab_badge_awarded', $user_id, $badge_id );
+        return true;
+    }
+
+    public function notify_user_of_badge( $user_id, $badge_id ) {
+        $user = get_userdata( $user_id );
+        if ( ! $user ) {
+            return;
+        }
+        $badge_title = get_the_title( $badge_id );
+        $subject = sprintf( __( 'You earned a badge: %s', 'bp-achievements' ), $badge_title );
+        $message = sprintf( __( 'Congrats! You have been awarded the badge "%s" on %s.', 'bp-achievements' ), $badge_title, get_bloginfo( 'name' ) );
+        wp_mail( $user->user_email, $subject, $message );
+
+        // BuddyPress notification (if BP Notifications component exists)
+        if ( function_exists( 'bp_notifications_add_notification' ) ) {
+            bp_notifications_add_notification( array(
+                'user_id'           => $user_id,
+                'item_id'           => $badge_id,
+                'component_name'    => 'achievements',
+                'component_action'  => 'badge_awarded',
+                'date_notified'     => bp_core_current_time(),
+                'is_new'            => 1,
+            ) );
+        }
+    }
+
+    /* --------------------------- Admin / Frontend display --------------------------- */
+
+    public function display_member_badges() {
+        // show up to 10 badges on the member header
+        if ( ! bp_is_user() ) {
+            return;
+        }
+        $user_id = bp_displayed_user_id();
+        echo $this->get_badges_html( $user_id, array( 'max' => 10, 'show_title' => false ) );
+    }
+
+    public function get_badges_html( $user_id, $args = array() ) {
+        $defaults = array( 'max' => 0, 'show_title' => true );
+        $r = wp_parse_args( $args, $defaults );
+
+        $awarded = get_user_meta( $user_id, 'ab_awarded_badges', true );
+        if ( ! is_array( $awarded ) || empty( $awarded ) ) {
+            if ( $r['show_title'] ) {
+                return '<div class="bpab-badges"><em>' . esc_html__( 'No badges yet', 'bp-achievements' ) . '</em></div>';
+            }
+            return '';
+        }
+
+        if ( $r['max'] > 0 ) {
+            $awarded = array_slice( $awarded, 0, $r['max'] );
+        }
+
+        $html = '<div class="bpab-badges">';
+        if ( $r['show_title'] ) {
+            $html .= '<h4>' . esc_html__( 'Badges', 'bp-achievements' ) . '</h4>';
+        }
+        $html .= '<ul class="bpab-badge-list">';
+        foreach ( $awarded as $badge_id ) {
+            $title = get_the_title( $badge_id );
+            $image_id = get_post_meta( $badge_id, 'ab_image_id', true );
+            $img = '';
+            if ( $image_id ) {
+                $src = wp_get_attachment_image_url( $image_id, 'thumbnail' );
+                if ( $src ) {
+                    $img = '<img src="' . esc_url( $src ) . '" alt="' . esc_attr( $title ) . '" /> ';
+                }
+            }
+            $html .= '<li class="bpab-badge-item" data-badge-id="' . esc_attr( $badge_id ) . '">' . $img . '<span class="bpab-badge-title">' . esc_html( $title ) . '</span></li>';
+        }
+        $html .= '</ul></div>';
+        return $html;
+    }
+
+    public function shortcode_user_badges( $atts ) {
+        $a = shortcode_atts( array( 'user_id' => 0, 'max' => 0 ), $atts );
+        $user_id = intval( $a['user_id'] );
+        if ( ! $user_id ) {
+            if ( is_user_logged_in() ) {
+                $user_id = get_current_user_id();
+            } else {
+                return '';
+            }
+        }
+        $args = array( 'max' => intval( $a['max'] ) );
+        return $this->get_badges_html( $user_id, $args );
+    }
+
+    /* --------------------------- AJAX / REST helpers --------------------------- */
+
+    public function ajax_award_badge() {
+        if ( ! current_user_can( 'edit_posts' ) ) {
+            wp_send_json_error( 'nope' );
+        }
+        check_ajax_referer( 'bpab', 'nonce' );
+        $user_id = intval( $_POST['user_id'] );
+        $badge_id = intval( $_POST['badge_id'] );
+        $res = $this->award_badge_to_user( $user_id, $badge_id );n
+        if ( $res ) {
+            wp_send_json_success();
+        }
+        wp_send_json_error();
+    }
+
+    /* --------------------------- Programmatic API --------------------------- */
+
+    // Public static helper for other plugins/themes to award a badge programmatically
+    public static function award_badge( $user_id, $badge_id, $silent = false ) {
+        return self::instance()->award_badge_to_user( $user_id, $badge_id, $silent );
+    }
+
+    // Check if a user has a badge
+    public static function has_badge( $user_id, $badge_id ) {
+        return self::instance()->user_has_badge( $user_id, $badge_id );
+    }
+}
+
+BP_Achievements::instance();
+
+// Convenience procedural wrappers
+function bpab_award_badge( $user_id, $badge_id, $silent = false ) {
+    return BP_Achievements::award_badge( $user_id, $badge_id, $silent );
+}
+
+function bpab_user_has_badge( $user_id, $badge_id ) {
+    return BP_Achievements::has_badge( $user_id, $badge_id );
+}
+
+// Add simple CSS for the list in case the theme doesn't have it
+add_action( 'wp_head', function() {
+    echo '<style>.bpab-badges{margin:8px 0}.bpab-badge-list{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:6px}.bpab-badge-item{display:flex;align-items:center;background:#fff;border:1px solid #eee;padding:6px;border-radius:6px}.bpab-badge-item img{max-width:48px;margin-right:6px}.bpab-badge-title{font-size:13px}</style>';
+} );
+
+// End of plugin
